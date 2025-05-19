@@ -1,0 +1,36 @@
+/* web_dashboard/static/css/style.css */
+body { font-family: sans-serif; margin: 0; background-color: #f4f4f4; color: #333; }
+.container { width: 90%; max-width: 1200px; margin: 20px auto; background-color: #fff; padding: 20px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+h1, h2 { color: #333; text-align: center; }
+.status-bar { background-color: #e9ecef; padding: 10px; margin-bottom: 15px; border-radius: 4px; text-align: center; }
+.controls { text-align: center; margin-bottom: 20px; }
+.controls button { padding: 10px 15px; margin: 5px; background-color: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
+.controls button:hover { background-color: #0056b3; }
+#stop-train-btn { background-color: #dc3545; }
+#stop-train-btn:hover { background-color: #c82333; }
+
+.tabs { overflow: hidden; border-bottom: 1px solid #ccc; margin-bottom: 20px; }
+.tabs button { background-color: inherit; float: left; border: none; outline: none; cursor: pointer; padding: 14px 16px; transition: 0.3s; font-size: 17px; }
+.tabs button:hover { background-color: #ddd; }
+.tabs button.active { background-color: #ccc; }
+
+.tab-content { display: none; padding: 6px 12px; border-top: none; }
+.tab-content.active { display: block; }
+
+.chart-container { width: 100%; margin: 20px auto; } /* Make charts take full width of their parent */
+
+#config-params-container div { margin-bottom: 10px; }
+#config-params-container label { display: inline-block; width: 250px; }
+#config-params-container input { padding: 5px; width: 150px; }
+#save-config-btn { margin-top: 15px; padding: 8px 12px; background-color: #28a745; color: white; border: none; border-radius: 4px; cursor: pointer; }
+#save-config-btn:hover { background-color: #218838; }
+
+#log-output {
+    height: 300px;
+    overflow-y: scroll;
+    border: 1px solid #ccc;
+    padding: 10px;
+    background-color: #f8f9fa;
+    white-space: pre-wrap; /* Preserve line breaks and spaces */
+    font-family: monospace;
+}
