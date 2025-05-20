@@ -1,3 +1,5 @@
+# --- START OF FILE utils.py ---
+
 # utils.py
 import ast
 import re
@@ -33,7 +35,7 @@ def is_safe_code(code_string, forbidden_modules):
                         return False
     except SyntaxError:
         return False
-    except RecursionError:
+    except RecursionError: # Handle deeply nested ASTs that could cause issues
         return False
     return True
 
@@ -76,6 +78,7 @@ def parse_think_answer(response_str: str):
         thought = think_match.group(1).strip()
         answer = answer_match.group(1).strip()
         return thought, answer, True
-    elif has_both_tag_pairs:
-        return None, None, False
+    elif has_both_tag_pairs: # Tags are present but malformed or empty content
+        return None, None, False # Consider this as "tags present but not parsable"
+    # If no tags at all
     return None, None, False
