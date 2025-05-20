@@ -8,15 +8,15 @@ import os
 import glob
 import pyarrow.parquet as pq
 import config
-from dataset_loader import get_dataloaders # FineWebPrefixLMDataset is used via get_dataloaders
+from dataset_loader import get_dataloaders 
 from tokenizer_wrapper import global_tokenizer
 import math
 import gc
 import traceback
 import torch.optim as optim
-import logging # Added logging
+import logging
 
-logger = logging.getLogger(__name__) # Added logger
+logger = logging.getLogger(__name__)
 
 def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, last_epoch=-1):
     """
@@ -36,7 +36,7 @@ def evaluate_model(model, val_dataloader, device, writer, global_step, phase_nam
     total_val_loss = 0
     if not val_dataloader or len(val_dataloader) == 0:
         logger.info(f"{phase_name} evaluation skipped: No validation dataloader or empty.")
-        return float('inf'), 0.0 # Return neutral values
+        return float('inf'), 0.0 
 
     progress_bar = tqdm(val_dataloader, desc=f"{phase_name} Evaluating", leave=False, ncols=100, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}')
     with torch.no_grad():
@@ -56,28 +56,31 @@ def evaluate_model(model, val_dataloader, device, writer, global_step, phase_nam
 
             except Exception as e:
                 logger.error(f"Error during {phase_name} evaluation batch {batch_idx}: {e}\n{traceback.format_exc()}")
-                # Optionally, re-raise or handle more gracefully
-                continue # Skip this batch
+                continue 
 
     avg_val_loss = total_val_loss / len(val_dataloader) if len(val_dataloader) > 0 else float('inf')
     
-    if writer: # Check if writer is provided
+    if writer: 
         writer.add_scalar(f'{phase_name}/Loss_Eval_Step', avg_val_loss, global_step)
     
     logger.info(f"{phase_name} Evaluation Complete. Avg Loss: {avg_val_loss:.4f} (at global step {global_step})")
     progress_bar.close()
-    return avg_val_loss, 0.0 # Second value could be BLEU or other metric if implemented
+    return avg_val_loss, 0.0 
 
 def precalculate_total_prefix_lm_steps(files_to_cycle, docs_chunk_size, batch_size, tokenizer_path, model_run_name_for_cache):
     logger.info(f"Pre-calculating PrefixLM steps for run '{model_run_name_for_cache}' (this may build or check caches)...")
+    logger.info(f"  Using config.PROJECT_ROOT: {config.PROJECT_ROOT}")
+    logger.info(f"  Targeting cache base template: {config.CACHE_DIR_BASE_TEMPLATE}")
+    
     total_estimated_steps_one_pass = 0
     
-    # This base path should align with how FineWebPrefixLMDataset constructs its cache paths
-    run_specific_cache_base = os.path.join(config.PROJECT_ROOT, "dataset_cache", model_run_name_for_cache)
+    run_specific_cache_base = config.CACHE_DIR_BASE_TEMPLATE.format(model_run_name=model_run_name_for_cache)
+    logger.info(f"  Run-specific cache base for pre-calculation: {run_specific_cache_base}")
+
 
     for clm_file_path in tqdm(files_to_cycle, desc="Pre-calculating steps (files)", unit="file", ncols=100):
-        # Estimate total documents in this file. Parquet metadata is preferred.
-        estimated_total_docs_in_file = docs_chunk_size # Fallback
+        logger.debug(f"  Pre-calculating for file: {clm_file_path}")
+        estimated_total_docs_in_file = docs_chunk_size 
         try:
             pf = pq.ParquetFile(clm_file_path)
             if pf.metadata: estimated_total_docs_in_file = pf.metadata.num_rows
@@ -89,16 +92,14 @@ def precalculate_total_prefix_lm_steps(files_to_cycle, docs_chunk_size, batch_si
         current_doc_offset = 0
         
         for _ in tqdm(range(num_chunks_in_file), desc=f"Pre-calc Chunks for {os.path.basename(clm_file_path)}", unit="chunk", leave=False, ncols=100):
-            # Instantiate dataset to trigger cache build/load and get length
-            # Ensure parameters match those used in actual training loader
             dataset_chunk, _, num_examples_in_this_chunk = get_dataloaders(
                 task_type="prefix_lm_pretrain",
-                tokenizer=global_tokenizer, # Not strictly needed by get_dataloaders here, but FineWeb... uses it
-                batch_size=batch_size, # Not used for len, but part of signature
+                tokenizer=global_tokenizer, 
+                batch_size=batch_size, 
                 specific_file_path=clm_file_path,
                 start_doc_offset=current_doc_offset,
                 num_docs_in_chunk=docs_chunk_size,
-                model_run_name_for_cache=model_run_name_for_cache # Crucial for correct cache path
+                model_run_name_for_cache=model_run_name_for_cache 
             )
 
             if num_examples_in_this_chunk > 0:
@@ -107,60 +108,68 @@ def precalculate_total_prefix_lm_steps(files_to_cycle, docs_chunk_size, batch_si
             if dataset_chunk: del dataset_chunk; gc.collect()
             
             current_doc_offset += docs_chunk_size
-            if current_doc_offset >= estimated_total_docs_in_file: # Stop if we've processed all estimated docs
+            if current_doc_offset >= estimated_total_docs_in_file: 
                  break
                  
     logger.info(f"Pre-calculation complete. Estimated PrefixLM steps for ONE pass: {total_estimated_steps_one_pass}")
     return total_estimated_steps_one_pass
 
 
-def run_prefix_lm_pretraining_phase(model, writer, model_run_name): # model_run_name is the unique dir name
+def run_prefix_lm_pretraining_phase(model, writer, model_run_name): 
     logger.info(f"--- PrefixLM Pre-training Phase Initiated for run: {model_run_name} ---")
     device = model.device
     batch_size = config.PREFIXLM_BATCH_SIZE
-    total_passes = config.PREFIXLM_TOTAL_PASSES # Total passes over the dataset
-    docs_chunk_size = config.DOCS_CHUNK_SIZE_PER_PREFIXLM_EPOCH # Docs per sub-dataset
+    total_passes = config.PREFIXLM_TOTAL_PASSES 
+    docs_chunk_size = config.DOCS_CHUNK_SIZE_PER_PREFIXLM_EPOCH 
 
-    files = sorted(glob.glob(os.path.join(config.FINEWEB_DATA_DIR, "*.parquet")))
-    files_to_cycle = files[:config.NUM_FINEWEB_FILES_TO_CYCLE]
-    if not files_to_cycle:
-        logger.warning("No FineWeb files found. Skipping PrefixLM pre-training.")
+    # Construct search pattern for FineWeb files
+    fineweb_search_pattern = os.path.join(config.FINEWEB_DATA_DIR, "*.parquet")
+    logger.info(f"Searching for FineWeb files in: {config.FINEWEB_DATA_DIR} with pattern: {fineweb_search_pattern}")
+    all_found_files = sorted(glob.glob(fineweb_search_pattern))
+    logger.info(f"Found {len(all_found_files)} FineWeb files initially: {all_found_files if len(all_found_files) < 10 else str(all_found_files[:5]) + '...'}")
+
+    if not all_found_files:
+        logger.warning(f"No FineWeb .parquet files found in directory '{config.FINEWEB_DATA_DIR}'. Skipping PrefixLM pre-training.")
         return
 
-    # Pre-calculate total steps for the LR scheduler accurately
-    # model_run_name is used for consistent cache pathing
+    # Determine files to cycle based on config.NUM_FINEWEB_FILES_TO_CYCLE
+    if config.NUM_FINEWEB_FILES_TO_CYCLE <= 0: # Use all files if 0 or negative
+        files_to_cycle = all_found_files
+    else:
+        files_to_cycle = all_found_files[:config.NUM_FINEWEB_FILES_TO_CYCLE]
+    
+    logger.info(f"Selected {len(files_to_cycle)} FineWeb files for this run based on NUM_FINEWEB_FILES_TO_CYCLE={config.NUM_FINEWEB_FILES_TO_CYCLE}.")
+
+    if not files_to_cycle: # Should not happen if all_found_files was not empty and NUM_FINEWEB_FILES_TO_CYCLE wasn't misconfigured to slice to empty
+        logger.warning("After applying NUM_FINEWEB_FILES_TO_CYCLE, no files selected. Skipping PrefixLM pre-training.")
+        return
+
     steps_one_pass = precalculate_total_prefix_lm_steps(files_to_cycle, docs_chunk_size, batch_size, config.TOKENIZER_MODEL_PATH, model_run_name)
     total_training_steps = steps_one_pass * total_passes
     
     if total_training_steps == 0:
-        logger.warning("Total estimated PrefixLM steps is 0. Skipping pre-training.")
+        logger.warning("Total estimated PrefixLM steps is 0 (possibly no data in selected files/chunks). Skipping pre-training.")
         return
     logger.info(f"Total estimated PrefixLM steps for {total_passes} passes: {total_training_steps}")
 
     initial_step_from_checkpoint = 0
-    # model.load_checkpoint returns (last_completed_epoch/step + 1) or 0 if no checkpoint
-    # For PrefixLM, this "epoch" is actually the global_step
-    resumed_from_step = model.load_checkpoint(config.CLM_PRETRAIN_CHECKPOINT_FILENAME)
+    resumed_from_step = model.load_checkpoint(config.PREFIXLM_CHECKPOINT_FILENAME) # Use specific PrefixLM checkpoint
     if resumed_from_step > 0:
-        initial_step_from_checkpoint = resumed_from_step -1 # Scheduler's last_epoch is 0-indexed num of steps completed
+        initial_step_from_checkpoint = resumed_from_step -1 
         logger.info(f"Resuming PrefixLM from global_step: {initial_step_from_checkpoint + 1}")
     
-    # Re-initialize optimizer (or ensure it's compatible if loaded)
-    # For simplicity, let's assume the model's optimizer is either fresh or loaded correctly.
-    # The scheduler needs to be fresh or its state loaded correctly.
-    if model.scheduler: del model.scheduler # remove old one if any
+    if model.scheduler: del model.scheduler 
     model.scheduler = get_linear_schedule_with_warmup(
         model.optimizer, 
         config.LR_SCHEDULER_WARMUP_STEPS, 
         total_training_steps, 
-        last_epoch=initial_step_from_checkpoint # last_epoch is "number of steps already taken"
+        last_epoch=initial_step_from_checkpoint 
     )
-    global_step_counter = initial_step_from_checkpoint # Number of steps already completed
+    global_step_counter = initial_step_from_checkpoint 
 
     for pass_idx in range(total_passes):
         logger.info(f"PrefixLM Global Pass {pass_idx + 1}/{total_passes}")
         
-        # Rough check to skip pass if already covered by resumed global_step_counter
         if steps_one_pass > 0 and global_step_counter >= (pass_idx + 1) * steps_one_pass:
             logger.info(f"  Skipping Pass {pass_idx + 1} as global_step_counter ({global_step_counter}) is beyond this pass's range.")
             continue
@@ -170,13 +179,12 @@ def run_prefix_lm_pretraining_phase(model, writer, model_run_name): # model_run_
         for file_idx, file_path in enumerate(files_to_cycle):
             logger.info(f"  PrefixLM File {file_idx + 1}/{len(files_to_cycle)} in Pass {pass_idx+1}: {os.path.basename(file_path)}")
             
-            # Estimate total documents in this file for chunking progress
-            estimated_total_docs_in_file = docs_chunk_size # Fallback
+            estimated_total_docs_in_file = docs_chunk_size 
             try:
                 pf = pq.ParquetFile(file_path)
                 if pf.metadata: estimated_total_docs_in_file = pf.metadata.num_rows
                 del pf
-            except Exception: pass # Keep fallback
+            except Exception: pass 
             
             num_chunks_in_file = math.ceil(estimated_total_docs_in_file / docs_chunk_size)
             current_doc_offset = 0
@@ -185,8 +193,6 @@ def run_prefix_lm_pretraining_phase(model, writer, model_run_name): # model_run_
                 if global_step_counter >= total_training_steps: break
                 logger.info(f"    File {os.path.basename(file_path)}, Doc Chunk {chunk_in_file_idx + 1}/{num_chunks_in_file} (offset {current_doc_offset})")
                 
-                # Get dataloader for the current chunk of the current file
-                # model_run_name is passed for unique cache path generation by get_dataloaders -> FineWebPrefixLMDataset
                 train_dl, _, num_ex_chunk = get_dataloaders(
                     task_type="prefix_lm_pretrain", tokenizer=global_tokenizer, batch_size=batch_size,
                     specific_file_path=file_path, start_doc_offset=current_doc_offset,
@@ -194,7 +200,7 @@ def run_prefix_lm_pretraining_phase(model, writer, model_run_name): # model_run_
                     model_run_name_for_cache=model_run_name
                 )
                 
-                current_doc_offset += docs_chunk_size # Prepare for next chunk
+                current_doc_offset += docs_chunk_size 
 
                 if not train_dl or num_ex_chunk == 0:
                     logger.warning(f"      No examples in this chunk. Skipping.")
@@ -216,9 +222,9 @@ def run_prefix_lm_pretraining_phase(model, writer, model_run_name): # model_run_
                     
                     if not torch.isnan(loss) and not torch.isinf(loss):
                         loss.backward()
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # Gradient clipping
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) 
                         model.optimizer.step()
-                        if model.scheduler: model.scheduler.step() # Step scheduler
+                        if model.scheduler: model.scheduler.step() 
                         
                         if writer:
                             writer.add_scalar('PrefixLM/Batch_Loss', loss.item(), global_step_counter)
@@ -234,16 +240,13 @@ def run_prefix_lm_pretraining_phase(model, writer, model_run_name): # model_run_
                 pbar.close()
                 del train_dl, batch, src, dec_in, lbl, logits, loss; gc.collect()
                 
-                # Save checkpoint using global_step_counter as the 'epoch' for this phase
-                # model.current_phase_epoch within the model will be updated by load_checkpoint
-                # and save_checkpoint uses the passed epoch_num.
-                model.save_checkpoint(global_step_counter, config.CLM_PRETRAIN_CHECKPOINT_FILENAME) # Save progress
-                if current_doc_offset >= estimated_total_docs_in_file and estimated_total_docs_in_file > docs_chunk_size : break # Ensure we don't loop beyond file contents
+                model.save_checkpoint(global_step_counter, config.PREFIXLM_CHECKPOINT_FILENAME) 
+                if current_doc_offset >= estimated_total_docs_in_file and estimated_total_docs_in_file > docs_chunk_size : break 
             if global_step_counter >= total_training_steps: break
         if global_step_counter >= total_training_steps: break
         
     logger.info(f"--- PrefixLM Pre-training Completed (Total Global Steps: {global_step_counter}) ---")
-    model.save_checkpoint(global_step_counter, config.CLM_PRETRAIN_CHECKPOINT_FILENAME) # Final save
+    model.save_checkpoint(global_step_counter, config.PREFIXLM_CHECKPOINT_FILENAME) 
     if hasattr(model, 'scheduler') and model.scheduler: del model.scheduler; model.scheduler = None; gc.collect()
 
 
@@ -256,10 +259,10 @@ def run_supervised_training_phase(model, writer, model_run_name):
         tokenizer=global_tokenizer, 
         batch_size=config.SUPERVISED_BATCH_SIZE, 
         val_split_ratio=config.SUPERVISED_VALIDATION_SPLIT_RATIO,
-        model_run_name_for_cache=model_run_name # Though not strictly for cache, good for consistency
+        model_run_name_for_cache=model_run_name 
     )
-    if result is None or result[0] is None:
-        logger.error("ERROR: Failed to create supervised code DataLoaders. Aborting supervised phase.")
+    if result is None or result[0] is None: # get_dataloaders returns (train_dl, val_dl) for supervised
+        logger.error("ERROR: Failed to create supervised code DataLoaders (train_dl is None). Aborting supervised phase.")
         return
     train_dataloader, val_dataloader = result
 
@@ -272,86 +275,87 @@ def run_supervised_training_phase(model, writer, model_run_name):
         logger.warning("No steps for supervised training (empty dataloader or 0 epochs). Skipping.")
         return
 
-    # --- Checkpoint and Optimizer/Scheduler Initialization ---
-    # Determine if resuming supervised, starting from CLM, or starting fresh
-    start_epoch = 0 # 0-indexed for the loop (epoch to begin training)
+    start_epoch = 0 
     resumed_supervised_checkpoint = False
+    optimizer_loaded_from_checkpoint = False
+    scheduler_loaded_from_checkpoint = False
 
-    # Try loading best supervised checkpoint first
-    if os.path.exists(os.path.join(model.model_run_dir, config.BEST_MODEL_SUPERVISED_CHECKPOINT_FILENAME)):
-        logger.info(f"Loading best supervised checkpoint: {config.BEST_MODEL_SUPERVISED_CHECKPOINT_FILENAME}")
-        # load_checkpoint returns (last_completed_epoch + 1)
+
+    best_supervised_ckpt_path = os.path.join(model.model_run_dir, config.BEST_MODEL_SUPERVISED_CHECKPOINT_FILENAME)
+    regular_supervised_ckpt_path = os.path.join(model.model_run_dir, config.SUPERVISED_CHECKPOINT_FILENAME)
+
+    if os.path.exists(best_supervised_ckpt_path):
+        logger.info(f"Attempting to load best supervised checkpoint: {config.BEST_MODEL_SUPERVISED_CHECKPOINT_FILENAME}")
         start_epoch = model.load_checkpoint(config.BEST_MODEL_SUPERVISED_CHECKPOINT_FILENAME)
-        # If optimizer/scheduler were loaded, model.optimizer and model.scheduler are now populated.
         resumed_supervised_checkpoint = True
-    # Else, try loading regular supervised checkpoint
-    elif os.path.exists(os.path.join(model.model_run_dir, config.SUPERVISED_CHECKPOINT_FILENAME)):
-        logger.info(f"Loading regular supervised checkpoint: {config.SUPERVISED_CHECKPOINT_FILENAME}")
+        # Check if optimizer and scheduler were actually loaded by model.load_checkpoint
+        # This requires model.load_checkpoint to indicate this, or we assume they were if checkpoint existed.
+        # For simplicity, we assume if start_epoch > 0, they were likely loaded if present in checkpoint.
+        if start_epoch > 0: optimizer_loaded_from_checkpoint = scheduler_loaded_from_checkpoint = True
+
+
+    elif os.path.exists(regular_supervised_ckpt_path):
+        logger.info(f"Attempting to load regular supervised checkpoint: {config.SUPERVISED_CHECKPOINT_FILENAME}")
         start_epoch = model.load_checkpoint(config.SUPERVISED_CHECKPOINT_FILENAME)
         resumed_supervised_checkpoint = True
+        if start_epoch > 0: optimizer_loaded_from_checkpoint = scheduler_loaded_from_checkpoint = True
     
-    # If not resuming a supervised checkpoint, decide if starting from CLM or entirely fresh
     if not resumed_supervised_checkpoint:
-        clm_checkpoint_path = os.path.join(model.model_run_dir, config.CLM_PRETRAIN_CHECKPOINT_FILENAME)
-        if os.path.exists(clm_checkpoint_path):
-            logger.info(f"No supervised checkpoint found. Loading CLM pretrained model from {clm_checkpoint_path} as starting point for fine-tuning.")
-            # Load CLM weights. This might also load CLM optimizer/scheduler state into model attributes.
-            model.load_checkpoint(config.CLM_PRETRAIN_CHECKPOINT_FILENAME) 
-            # We are starting supervised training fresh, so epochs start from 0 for this phase.
+        prefixlm_checkpoint_path = os.path.join(model.model_run_dir, config.PREFIXLM_CHECKPOINT_FILENAME)
+        if os.path.exists(prefixlm_checkpoint_path):
+            logger.info(f"No supervised checkpoint found. Loading PrefixLM pretrained model from {prefixlm_checkpoint_path} as starting point for fine-tuning.")
+            # Only loads model weights, does not affect optimizer/scheduler for the new phase
+            model.load_checkpoint(config.PREFIXLM_CHECKPOINT_FILENAME) 
             start_epoch = 0 
-            # Optimizer and Scheduler must be re-initialized for the supervised phase
-            logger.info("Re-initializing optimizer and scheduler for supervised fine-tuning.")
-            model.optimizer = optim.AdamW(model.parameters(), lr=config.NN_LEARNING_RATE / 2, weight_decay=config.OPTIMIZER_WEIGHT_DECAY) # Example: smaller LR for fine-tune
-            if hasattr(model, 'scheduler') and model.scheduler: del model.scheduler
-            model.scheduler = get_linear_schedule_with_warmup(
-                model.optimizer, 
-                min(config.LR_SCHEDULER_WARMUP_STEPS, num_training_steps_supervised // 10), # Warmup for a portion of supervised steps
-                num_training_steps_supervised,
-                last_epoch=-1 # Start scheduler fresh
-            )
-            # Clear any supervised-specific history from previous (unrelated) runs if model object is reused
+            model.current_phase_step_or_epoch = 0 # Reset phase epoch for supervised
+            # Clear supervised history if starting fine-tuning fresh from PrefixLM
             model.history['supervised_train_epoch_loss'] = []
             model.history['supervised_validation_loss'] = []
-            model.history['supervised_validation_bleu'] = [] # Assuming BLEU is a metric
         else:
-            logger.info("No supervised or CLM checkpoints found. Starting supervised training from scratch with fresh optimizer/scheduler.")
+            logger.info("No supervised or PrefixLM checkpoints found. Starting supervised training from scratch.")
             start_epoch = 0
-            model.optimizer = optim.AdamW(model.parameters(), lr=config.NN_LEARNING_RATE, weight_decay=config.OPTIMIZER_WEIGHT_DECAY)
-            if hasattr(model, 'scheduler') and model.scheduler: del model.scheduler
-            model.scheduler = get_linear_schedule_with_warmup(
-                model.optimizer, 
-                config.LR_SCHEDULER_WARMUP_STEPS, 
-                num_training_steps_supervised,
-                last_epoch=-1
-            )
-    else: # Resumed a supervised checkpoint
-        logger.info(f"Resuming supervised training. Optimizer and Scheduler state loaded from checkpoint.")
-        # Ensure scheduler's total steps are for this phase, might need re-init if total_steps changed
-        # However, load_checkpoint should restore it. If not, re-init here using loaded optimizer.
-        # For LambdaLR, if total_steps changed, it should be re-created.
-        # For simplicity, let's assume load_checkpoint correctly restores scheduler or it's robust enough.
-        # A more robust way if total_steps might change across resumption:
-        # current_scheduler_step = model.scheduler.last_epoch if model.scheduler else -1 (if scheduler was loaded)
-        # model.scheduler = get_linear_schedule_with_warmup(model.optimizer, ..., num_training_steps_supervised, last_epoch=current_scheduler_step)
+            model.current_phase_step_or_epoch = 0
+    
+    # Initialize or re-initialize optimizer and scheduler if not loaded from a dedicated supervised checkpoint
+    if not optimizer_loaded_from_checkpoint:
+        logger.info("Initializing new AdamW optimizer for supervised phase.")
+        model.optimizer = optim.AdamW(model.parameters(), lr=config.NN_LEARNING_RATE / 2 if resumed_supervised_checkpoint else config.NN_LEARNING_RATE, weight_decay=config.OPTIMIZER_WEIGHT_DECAY)
+    
+    if not scheduler_loaded_from_checkpoint:
+        logger.info("Initializing new LR scheduler for supervised phase.")
+        if hasattr(model, 'scheduler') and model.scheduler: del model.scheduler
+        # last_epoch for scheduler is (start_epoch_0_indexed * steps_per_epoch) - 1
+        # However, get_linear_schedule_with_warmup's last_epoch is number of steps taken
+        # If start_epoch is the *next* epoch to run (1-indexed from load_checkpoint),
+        # then (start_epoch - 1) is num completed epochs.
+        # For simplicity, if not loaded, start scheduler fresh (-1) or from where optim state suggests.
+        # If optimizer was also fresh, last_epoch = -1. If optimizer was loaded but scheduler not, it's complex.
+        # Safest is to re-init scheduler based on current completed supervised epochs.
+        completed_epochs_for_scheduler = model.current_phase_step_or_epoch # This is last *completed* epoch
+        last_scheduler_step = completed_epochs_for_scheduler * len(train_dataloader) -1 if completed_epochs_for_scheduler > 0 else -1
 
-    # `model.current_phase_epoch` is updated by `load_checkpoint` to last completed epoch.
-    # The loop should start from `start_epoch` which is (last_completed_epoch + 1).
-    # So, loop from `model.current_phase_epoch` if it was set by load_checkpoint, or `start_epoch` if fresh.
-    # `load_checkpoint` sets `model.current_phase_epoch` to the epoch number *saved in the checkpoint*.
-    # This is the last *completed* epoch. So, training starts from `model.current_phase_epoch`.
-    # The loop should be: for epoch_idx_0_based in range(model.current_phase_epoch, config.SUPERVISED_EPOCHS):
+        model.scheduler = get_linear_schedule_with_warmup(
+            model.optimizer, 
+            min(config.LR_SCHEDULER_WARMUP_STEPS, num_training_steps_supervised // 10),
+            num_training_steps_supervised,
+            last_epoch=last_scheduler_step
+        )
 
-    initial_completed_epochs = model.current_phase_epoch if resumed_supervised_checkpoint else 0
-    if start_epoch > initial_completed_epochs : # If load_checkpoint returned a higher start_epoch due to some logic
-        initial_completed_epochs = start_epoch -1
-
-    logger.info(f"Starting supervised training from epoch {initial_completed_epochs +1}. Last completed epoch: {initial_completed_epochs}.")
-
-    global_sup_step = initial_completed_epochs * len(train_dataloader)
+    # model.current_phase_step_or_epoch should be the last *completed* epoch (0-indexed)
+    # The loop should go from this completed epoch up to total_epochs - 1.
+    # So, if model.current_phase_step_or_epoch is 0 (start fresh or after PrefixLM), loop starts at 0.
+    # If model.current_phase_step_or_epoch is N (resumed after N epochs), loop starts at N.
+    
+    loop_start_epoch_0_indexed = model.current_phase_step_or_epoch
+    logger.info(f"Supervised training will run from epoch {loop_start_epoch_0_indexed + 1} to {config.SUPERVISED_EPOCHS}.")
+    
+    # This global_sup_step is for TensorBoard logging across all supervised epochs.
+    # It should resume correctly based on completed epochs.
+    global_sup_step = loop_start_epoch_0_indexed * len(train_dataloader)
     best_val_loss = min((h_val[1] for h_val in model.history.get('supervised_validation_loss', []) if h_val), default=float('inf'))
 
-    for epoch_idx_0_based in range(initial_completed_epochs, config.SUPERVISED_EPOCHS):
-        epoch_display_num = epoch_idx_0_based + 1 # For logging (1-indexed)
+    for epoch_idx_0_based in range(loop_start_epoch_0_indexed, config.SUPERVISED_EPOCHS):
+        epoch_display_num = epoch_idx_0_based + 1 
         logger.info(f"Supervised Code Epoch {epoch_display_num}/{config.SUPERVISED_EPOCHS}")
         
         if torch.cuda.is_available(): torch.cuda.empty_cache(); gc.collect()
@@ -374,7 +378,7 @@ def run_supervised_training_phase(model, writer, model_run_name):
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     model.optimizer.step()
-                    if model.scheduler: model.scheduler.step() # Step scheduler per batch
+                    if model.scheduler: model.scheduler.step() 
                     
                     epoch_loss_sum += loss.item()
                     num_batches_in_epoch += 1
@@ -390,38 +394,30 @@ def run_supervised_training_phase(model, writer, model_run_name):
 
                 global_sup_step += 1
 
-                # Periodic Validation
                 if val_dataloader and global_sup_step > 0 and global_sup_step % config.SUPERVISED_VALIDATE_EVERY_N_BATCHES == 0:
                     avg_val_loss, _ = evaluate_model(model, val_dataloader, device, writer, global_sup_step, "Supervised_Validation_Mid_Epoch")
-                    if writer: writer.add_scalar('Supervised_Validation/Step_Loss', avg_val_loss, global_sup_step) # Log with global_step
+                    if writer: writer.add_scalar('Supervised_Validation/Step_Loss', avg_val_loss, global_sup_step) 
                     
-                    # Store validation loss with global_step for more granular history if needed
-                    # model.history['supervised_validation_loss'].append((global_sup_step, avg_val_loss)) 
-                    # For epoch-level val loss, do it after epoch.
-
                     if avg_val_loss < best_val_loss: 
                         best_val_loss = avg_val_loss
                         logger.info(f"New best mid-epoch validation_loss: {best_val_loss:.4f} at step {global_sup_step}. Saving best model.")
-                        model.save_checkpoint(epoch_display_num, config.BEST_MODEL_SUPERVISED_CHECKPOINT_FILENAME) # Save with current epoch number
-                    model.train() # Set back to train mode
+                        model.save_checkpoint(epoch_display_num, config.BEST_MODEL_SUPERVISED_CHECKPOINT_FILENAME, is_best=True) 
+                    model.train() 
             except Exception as e_batch:
                 logger.error(f"Error during supervised training batch {batch_idx} in epoch {epoch_display_num}: {e_batch}\n{traceback.format_exc()}")
-                continue # Skip to next batch
+                continue 
 
         progress_bar.close()
         avg_epoch_train_loss = epoch_loss_sum / num_batches_in_epoch if num_batches_in_epoch > 0 else float('inf')
         if writer: writer.add_scalar('Supervised/Train_Epoch_Loss', avg_epoch_train_loss, epoch_display_num)
         
-        # Update training history for this epoch
-        # Remove old entry for this epoch if resuming and re-running it
         model.history['supervised_train_epoch_loss'] = [(e,v) for e,v in model.history.get('supervised_train_epoch_loss',[]) if e != epoch_display_num]
         model.history['supervised_train_epoch_loss'].append((epoch_display_num, avg_epoch_train_loss))
         model.history['supervised_train_epoch_loss'].sort(key=lambda x:x[0])
 
-        # End-of-Epoch Validation
         if val_dataloader:
             logger.info(f"Running end-of-epoch validation for Supervised Epoch {epoch_display_num}...")
-            avg_val_loss_epoch, _ = evaluate_model(model, val_dataloader, device, writer, global_sup_step, "Supervised_Validation_Epoch_End") # Use global_step or epoch_display_num
+            avg_val_loss_epoch, _ = evaluate_model(model, val_dataloader, device, writer, global_sup_step, "Supervised_Validation_Epoch_End") 
             if writer: writer.add_scalar('Supervised_Validation/Epoch_End_Loss', avg_val_loss_epoch, epoch_display_num)
 
             model.history['supervised_validation_loss'] = [(e,v) for e,v in model.history.get('supervised_validation_loss',[]) if e != epoch_display_num]
@@ -431,15 +427,14 @@ def run_supervised_training_phase(model, writer, model_run_name):
             if avg_val_loss_epoch < best_val_loss:
                 best_val_loss = avg_val_loss_epoch
                 logger.info(f"New best end-of-epoch validation_loss: {best_val_loss:.4f}. Saving best model.")
-                model.save_checkpoint(epoch_display_num, config.BEST_MODEL_SUPERVISED_CHECKPOINT_FILENAME)
+                model.save_checkpoint(epoch_display_num, config.BEST_MODEL_SUPERVISED_CHECKPOINT_FILENAME, is_best=True)
         
-        # Save regular checkpoint
         if epoch_display_num % config.SUPERVISED_SAVE_EVERY_N_EPOCHS == 0: 
             model.save_checkpoint(epoch_display_num, config.SUPERVISED_CHECKPOINT_FILENAME)
         
-        model.current_phase_epoch = epoch_display_num # Update model's tracker of completed epochs for this phase
+        model.current_phase_step_or_epoch = epoch_display_num 
         gc.collect()
 
     logger.info("--- Supervised Code Training Phase Completed ---")
-    model.save_checkpoint(model.current_phase_epoch, config.SUPERVISED_CHECKPOINT_FILENAME) # Save final model
+    model.save_checkpoint(model.current_phase_step_or_epoch, config.SUPERVISED_CHECKPOINT_FILENAME) 
     if hasattr(model, 'scheduler') and model.scheduler: del model.scheduler; model.scheduler = None; gc.collect()
